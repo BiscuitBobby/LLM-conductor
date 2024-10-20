@@ -1,3 +1,5 @@
+from conductor.client.workflow.task.terminate_task import TerminateTask
+
 from agents import planner
 from models import llm
 from parcer.extract import split_plan, extract_plan_details, get_current_task
@@ -18,7 +20,7 @@ def write_steps_dict(steps_dict, filename="steps_dict.json"):
 
 def create_function(func_name, current_plan, step_name, dep):
     @worker_task(task_definition_name=func_name)
-    def dynamic_function(prompt=''):
+    def dynamic_function(prompt:str=''):
         # Read the steps_dict from the JSON file
         steps_dict = read_steps_dict()
 
@@ -34,7 +36,9 @@ def create_function(func_name, current_plan, step_name, dep):
         steps_dict[step_name]["output"] = f"output from task: {prompt}"
 
         write_steps_dict(steps_dict)
+        return dict(status = "success")
 
+    dynamic_function.func_name = func_name
     globals()[func_name] = dynamic_function
     return func_name
 
@@ -110,13 +114,66 @@ def create_threads(plan):
     return groups
 
 planner = planner.agent_init(llm.gemini_pro,arsenal)
-input_data = {"input": "find electronics shopping enthusiasts and find the total amount of money that they've spent"}
+input_data = {"input": "find electronics shopping enthusiasts and find the total amount of money that they've spent. Finally send John a hi"}
 
-# plan = planner.invoke(input_data).content
-plan = '''
-Plan: Find users who are interested in electronics. #E1 = FindUser[Interested in electronics]
-Plan: Retrieve total amount spent by users from #E1. #E2 = Retrieve[total amount spent by #E1]
-Plan: Message John 'hi'. #E3 = Message[{john: hi}]
-'''
+from conductor.client.automator.task_handler import TaskHandler
+from conductor.client.configuration.configuration import Configuration
+from conductor.client.orkes_clients import OrkesClients
+from conductor.client.workflow.conductor_workflow import ConductorWorkflow
+from conductor.client.workflow.task.fork_task import ForkTask
+from conductor.client.workflow.task.join_task import JoinTask
 
-create_threads(plan)
+# API Configuration for Conductor
+api_config = Configuration()
+
+# TaskHandler to manage task execution
+task_handler = TaskHandler(configuration=api_config)
+task_handler.start_processes()
+
+# Create clients for accessing Conductor services
+clients = OrkesClients(configuration=api_config)
+workflow_executor = clients.get_workflow_executor()
+workflow_client = clients.get_workflow_client()
+
+# Function to check for running workflows
+workflow_name = 'parallel_workflow_with_steps'
+workflow_version = 1
+
+# Planner that generates execution threads (assuming 'planner' is defined elsewhere)
+plan = planner.invoke({"input": input_data}).content  # input_data is expected to be passed externally
+threads = create_threads(plan)
+print(threads)
+
+# Initialize the workflow
+workflow = ConductorWorkflow(name='parallel_workflow_with_steps', version=1, executor=workflow_executor)
+
+# Create forked tasks for parallel branches
+forked_tasks = []
+for i in threads:
+    # Create a list of tasks for the current branch
+    branch_tasks = []
+    for func in i:
+        print(f"Function name: {func.func_name}")
+        func.task_ref_name = f'{func.func_name}_ref'
+        func.__name__ = func.func_name
+        print(func.__name__)
+        # Use input_params to pass data to the task and output_params to capture the output
+        if branch_tasks:
+            previous_task = branch_tasks[-1]
+            input_params = previous_task.output_params
+        else:
+            input_params = {}
+        task = func(task_ref_name=func.func_name, input_params=input_params, output_params={})
+        branch_tasks.append(task)
+    forked_tasks.append(branch_tasks)
+
+# Define Fork and Join tasks
+fork_task = ForkTask(task_ref_name='fork_task', forked_tasks=forked_tasks)
+join_task = JoinTask(task_ref_name='join_task', join_on=[str(sublist[-1].task_ref_name) for sublist in forked_tasks])
+
+workflow.add(fork_task)
+workflow.add(join_task)
+
+# Execute the workflow
+result = workflow.execute(workflow_input={'userid': 'a'})
+print(f'\nworkflow output:  {result.output}\n')
